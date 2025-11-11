@@ -1,0 +1,114 @@
+library(ape)
+
+## helper function to standardize sp names: "Genus_species"
+.norm_us <- function(x) {
+  if (length(x) == 0) return(character(0))
+  x <- gsub("[._]", " ", x, perl = TRUE)          # merge separators
+  x <- trimws(gsub("\\s+", " ", x, perl = TRUE))  # eliminate spaces
+  vapply(strsplit(x, " "), function(z) {
+    if (!length(z)) return("")
+    z <- z[seq_len(min(2, length(z)))]
+    z <- paste0(toupper(substring(z,1,1)), tolower(substring(z,2)))
+    paste(z, collapse = "_")
+  }, FUN.VALUE = character(1), USE.NAMES = FALSE)
+}
+
+## Build candidate names per dataset column
+# keys for synonyms_forest are assumed to be "Genus_species"
+# candidates = std original name + std synonyms
+
+orig_cols <- colnames(for_clean)
+clean_cols_us <- .norm_us(orig_cols)
+
+# making sure every key exists in synonyms_forest (even if empty)
+missing_keys <- setdiff(clean_cols_us, names(synonyms_forest))
+if (length(missing_keys)) {
+  synonyms_forest[missing_keys] <- replicate(length(missing_keys), character(0), simplify = FALSE)
+}
+
+# candidates_by_col: names = original colnames; values = character vectors (underscored)
+candidates_by_col <- setNames(vector("list", length(orig_cols)), orig_cols)
+for (i in seq_along(orig_cols)) {
+  key <- clean_cols_us[i]  # e.g. "Eugenia_punicifolia"
+  syns_norm <- .norm_us(synonyms_forest[[key]])
+  candidates_by_col[[i]] <- unique(c(key, syns_norm))
+}
+
+#check if all synonyms are in the list
+candidates_by_col
+
+
+## Mapping each dataset column to a tip in the tree (Obs: case-insensitive, underscored)
+tips <- megatree$tip.label
+tips_low <- tolower(tips)
+
+match_first <- function(name_vec) {
+  if (!length(name_vec)) return(NA_character_)
+  m <- match(tolower(name_vec), tips_low)
+  m <- m[!is.na(m)]
+  if (length(m)) tips[m[1]] else NA_character_
+}
+
+col2tip <- vapply(candidates_by_col, match_first, FUN.VALUE = character(1))
+names(col2tip) <- names(candidates_by_col)
+
+# conservative genus-only fallback (only if exactly one species of that genus in tree)
+need_fallback <- which(is.na(col2tip))
+if (length(need_fallback)) {
+  for (j in need_fallback) {
+    gen <- strsplit(.norm_us(names(candidates_by_col)[j]), "_", fixed = TRUE)[[1]][1]
+    ghits <- grep(paste0("^", gen, "_"), tips, ignore.case = TRUE, value = TRUE)
+    if (length(ghits) == 1) col2tip[j] <- ghits[1]
+  }
+}
+
+## Joinning back to original columns
+map_cols <- data.frame(
+  original_name  = orig_cols,
+  clean_org_us   = clean_cols_us,
+  tree_tip_match = unname(col2tip),
+  stringsAsFactors = FALSE
+)
+map_cols$rename_to <- ifelse(is.na(map_cols$tree_tip_match),
+                             map_cols$original_name,      # keep original if no match
+                             map_cols$tree_tip_match)     # rename to matched tip
+
+## Transfering renames to the sites×species matrix
+df_new_names_for <- for_clean
+old2new <- setNames(map_cols$rename_to, map_cols$original_name)
+cols_in_mat <- intersect(names(old2new), colnames(df_new_names_for))
+colnames(df_new_names_for)[match(cols_in_mat, colnames(df_new_names_for))] <- old2new[cols_in_mat]
+
+#write.csv(df_new_names_for, "for_df_new_names.csv")
+
+
+##Here we merge duplicate columns created by synonym collapse
+dups <- which(duplicated(colnames(df_new_names)) | duplicated(colnames(df_new_names), fromLast = TRUE))
+if (length(dups)) {
+  species_levels <- unique(colnames(df_new_names)[dups])
+  for (s in species_levels) {
+    idx <- which(colnames(df_new_names) == s)
+    if (length(idx) > 1) {
+      # For presence/absence use max; for abundances keep sum (change if needed)
+      # df_new_names[, idx[1]] <- pmax.int(df_new_names[, idx, drop = FALSE])
+      df_new_names[, idx[1]] <- rowSums(as.matrix(df_new_names[, idx, drop = FALSE]), na.rm = TRUE)
+      df_new_names <- df_new_names[, -idx[-1], drop = FALSE]
+    }
+  }
+}
+
+## Finally prunning the mega-tree to exactly your dataset species
+keep_tips <- intersect(megatree$tip.label, colnames(df_new_names))
+phy_forest <- drop.tip(megatree, setdiff(megatree$tip.label, keep_tips))
+
+#write.tree(phy_forest, "phylogeny_forest.tre")
+
+#Checking before exporting
+ unmatched_for <- subset(map_cols, is.na(tree_tip_match))
+# write.csv(map_cols,  "for_name_map_dataset_to_tree.csv", row.names = FALSE)
+# write.csv(unmatched_for, "for_unmatched_species.csv",       row.names = FALSE)
+ saveRDS(phy_forest,  "for_phy_pruned_for_dataset.rds")
+
+plot(phy_forest)
+length(phy_forest$tip.label) #894
+plot(phy_forest, cex = 0.5, label.offset = 0.001, no.margin = TRUE)
